@@ -1,0 +1,7 @@
+.DS_Store
+
+# Local development files (the repo holds only the userscript)
+x-downloader.js
+build.js
+smoke-test.js
+x-downloader-loader.user.js
