@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         X Downloader
-// @version      0.1.0
+// @version      0.1.1
 // @description  Adds a download button to posts on X that saves every photo (original size) and video (highest quality), and remembers what was downloaded.
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -25,6 +25,12 @@
  * the post: photos at their original size, videos and GIFs as the MP4 with the highest bitrate.
  * A post without media of its own saves the media of the post it quotes.
  *
+ * On a profile's media tab, "Download all videos" and "Download all photos" in the tab's menu
+ * save every video and GIF, or every photo, of the account: into a folder named after it in a
+ * folder chosen once (Chrome, Edge), or in ZIP files of about 500 MB each (other browsers):
+ * the following pages of the tab are asked for as X's own page asks for them, posts already
+ * downloaded are skipped, and a box in the corner shows the progress, with a Stop button.
+ *
  * Downloads are remembered: a button whose post has been downloaded turns blue, and "Downloads"
  * in Tampermonkey's menu lists everything that was downloaded, newest first, with a search box.
  *
@@ -40,7 +46,7 @@
 
   const AUTO_START = true;
   /* Set by build.js to the userscript's version. */
-  const VERSION = "0.1.0";
+  const VERSION = "0.1.1";
   const HOST_TAG = "x-downloader";
   const LOG = "[X Downloader]";
   /* X's blue, for buttons whose post has been downloaded. */
@@ -64,6 +70,9 @@
   const page = typeof unsafeWindow === "object" && unsafeWindow ? unsafeWindow : window;
   const shared = page.__xDownloaderShared || (page.__xDownloaderShared = {
     posts: new Map(),
+    /* Account ids by lower-case username, and X's last request for each media timeline. */
+    userIds: new Map(),
+    timelines: {},
     nativeFetch: page.fetch.bind(page),
     listening: false,
   });
@@ -96,6 +105,8 @@
     const legacy = result?.legacy;
     if (!legacy || !/^\d+$/.test(result.rest_id || "")) return null;
     const user = result.core?.user_results?.result || {};
+    const screenName = user.core?.screen_name || user.legacy?.screen_name;
+    if (screenName && /^\d+$/.test(user.rest_id || "")) shared.userIds.set(screenName.toLowerCase(), user.rest_id);
     const media = (legacy.extended_entities?.media || legacy.entities?.media || []).map(normalizeMedia).filter(Boolean);
     return {
       id: result.rest_id,
@@ -130,14 +141,19 @@
     if (post.quoted) keep(post.quoted);
   }
 
-  /* Keeps every post found in a response, however deep it is. */
-  function collectPosts(value, depth = 0) {
+  /* Keeps every post found in a response, however deep it is. `found` (when given) gets the
+     posts of the response itself, in order, without the posts they quote or repost. */
+  function collectPosts(value, depth = 0, found = null) {
     if (!value || typeof value !== "object" || depth > 40) return;
     if (value.__typename === "Tweet" || value.__typename === "TweetWithVisibilityResults" || value.legacy && value.rest_id) {
       const post = fromApi(value);
-      if (post) keep(post);
+      if (post) {
+        keep(post);
+        found?.push(post);
+        found = null;
+      }
     }
-    for (const key in value) collectPosts(value[key], depth + 1);
+    for (const key in value) collectPosts(value[key], depth + 1, found);
   }
 
   function collectText(text) {
@@ -149,21 +165,53 @@
 
   const isApiUrl = url => /\/i\/api\/|\/graphql\/|api\.(x|twitter)\.com/.test(String(url || ""));
 
+  /* The media tab of a profile loads its posts with one of these requests ("Photos" and "Videos"
+     are its two choices; UserMedia was the single tab before them). */
+  const TIMELINES = ["UserPhotoTimeline", "UserVideoTimeline", "UserMedia"];
+  const timelineOf = url => String(url || "").match(/\/graphql\/[^/]+\/(UserPhotoTimeline|UserVideoTimeline|UserMedia)\b/)?.[1];
+
+  /* Keeps X's own request for a media timeline (its address and headers: the session's token
+     and CSRF token), so the following pages can be asked for the same way. */
+  function rememberTimeline(url, headers) {
+    const name = timelineOf(url);
+    if (!name) return;
+    const plain = {};
+    if (headers instanceof page.Headers || headers instanceof Headers) headers.forEach((value, key) => { plain[key] = value; });
+    else if (Array.isArray(headers)) for (const [key, value] of headers) plain[key] = value;
+    else Object.assign(plain, headers || {});
+    shared.timelines[name] = { url: new URL(url, location.href).href, headers: plain, at: Date.now() };
+  }
   /* Wraps fetch and XMLHttpRequest once to read X's API responses, which are left untouched. */
   function startListening() {
     if (shared.listening) return;
     shared.listening = true;
 
     const pageFetch = page.fetch;
-    page.fetch = function (input) {
+    page.fetch = function (input, init) {
       const result = pageFetch.apply(this, arguments);
       const url = typeof input === "string" ? input : input?.url;
-      if (isApiUrl(url)) result.then(response => response.clone().text()).then(collectText).catch(() => {});
+      if (isApiUrl(url)) {
+        try {
+          if (timelineOf(url)) rememberTimeline(url, init?.headers || input?.headers);
+        } catch (ignored) {}
+        result.then(response => response.clone().text()).then(collectText).catch(() => {});
+      }
       return result;
     };
 
     const open = page.XMLHttpRequest.prototype.open;
+    const setRequestHeader = page.XMLHttpRequest.prototype.setRequestHeader;
+    page.XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+      if (this.__xDownloaderHeaders) this.__xDownloaderHeaders[name] = value;
+      return setRequestHeader.apply(this, arguments);
+    };
     page.XMLHttpRequest.prototype.open = function (method, url) {
+      if (timelineOf(url)) {
+        const headers = this.__xDownloaderHeaders = {};
+        this.addEventListener("load", () => {
+          if (this.status === 200) rememberTimeline(url, headers);
+        });
+      }
       if (isApiUrl(url)) {
         this.addEventListener("load", () => {
           try {
@@ -199,7 +247,9 @@
 
   /* ---------- What was downloaded ---------- */
 
-  /* "t:<post id>": every photo and video of the post was downloaded. Each key maps to null
+  /* "t:<post id>": every photo and video of the post was downloaded (its button); "p:<post id>"
+     its photos, "v:<post id>" its videos and GIFs (downloading all of a profile's photos or
+     videos). Each key maps to null
      (kept for good); its details for the list of downloads are kept beside it as "i:<key>".
      Tampermonkey's storage is used when it is granted (it survives clearing x.com's site data),
      localStorage otherwise. */
@@ -238,6 +288,17 @@
     console.warn(LOG, "couldn't read the list of downloads", error);
   }
   const isDownloaded = key => !!key && downloaded.has(key);
+
+  /* Whether all of a post's media was downloaded: with its button, or its photos and its videos
+     each with "download all". */
+  function postDone(id) {
+    if (isDownloaded("t:" + id)) return true;
+    const media = posts.get(id)?.media || [];
+    if (!media.length) return false;
+    const photos = media.some(item => item.kind === "photo");
+    const videos = media.some(item => item.kind !== "photo");
+    return (!photos || isDownloaded("p:" + id)) && (!videos || isDownloaded("v:" + id));
+  }
 
   /* Buttons that show whether their post was downloaded, painted again when that changes. */
   const paintable = new Set();
@@ -380,15 +441,27 @@
   async function downloadPost(id, onProgress) {
     const { post, media } = mediaOf(await postFor(id));
     if (!media.length) throw new Error("This post has no photos or videos to download.");
+    return saveMedia(post, media, onProgress);
+  }
+
+  /* Downloads some of a post's photos and videos, as { name, blob } files. A file is numbered
+     by its place in the post ("… - 3.jpg" is the post's third), so its name is the same
+     whichever button saved it. */
+  async function fetchFiles(post, media, onProgress) {
+    const files = [];
     for (let index = 0; index < media.length; index++) {
       const blob = await downloadMedia(media[index], fraction => onProgress?.((index + fraction) / media.length));
-      const number = media.length > 1 ? " - " + (index + 1) : "";
+      const place = post.media.indexOf(media[index]);
+      const number = post.media.length > 1 ? " - " + (place + 1) : "";
       const extension = extensionOf(blob.type) || (media[index].kind === "photo" ? "jpg" : "mp4");
-      saveBlob(blob, fileBase(post) + number + "." + extension);
+      files.push({ name: fileBase(post) + number + "." + extension, blob });
       onProgress?.((index + 1) / media.length);
-      /* Browsers drop downloads started too close together. */
-      if (index < media.length - 1) await wait(300);
     }
+    return files;
+  }
+
+  /* What to remember about a download, for the list of downloads. */
+  function describePost(post, media) {
     const counts = ["photo", "video", "gif"].map(kind => [kind, media.filter(item => item.kind === kind).length]).filter(([, n]) => n);
     const label = { photo: ["Photo", "photos"], video: ["Video", "videos"], gif: ["GIF", "GIFs"] };
     return {
@@ -399,6 +472,112 @@
       posted: post.posted,
       kind: counts.map(([kind, n]) => n === 1 ? label[kind][0] : n + " " + label[kind][1]).join(", "),
       picture: media[0].preview,
+    };
+  }
+
+  /* Saves some of a post's photos and videos, each its own file. Returns what to remember. */
+  async function saveMedia(post, media, onProgress) {
+    const files = await fetchFiles(post, media, onProgress);
+    for (let index = 0; index < files.length; index++) {
+      saveBlob(files[index].blob, files[index].name);
+      /* Browsers drop downloads started too close together. */
+      if (index < files.length - 1) await wait(300);
+    }
+    return describePost(post, media);
+  }
+
+  /* ---------- ZIP files ---------- */
+
+  /* A ZIP file without compression (photos and videos are compressed already), written by hand:
+     a local header before each file, a central directory after them. Names are UTF-8. Each part
+     stays far below 4 GB, so the plain (not ZIP64) format is enough. */
+  const CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ c >>> 1 : c >>> 1;
+      table[n] = c >>> 0;
+    }
+    return table;
+  })();
+
+  function crc32(bytes) {
+    let crc = 0xffffffff;
+    for (let index = 0; index < bytes.length; index++) crc = CRC_TABLE[(crc ^ bytes[index]) & 0xff] ^ crc >>> 8;
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  /* Time and date in the format ZIP keeps them (local time, two-second steps). */
+  function dosTime(date) {
+    return {
+      time: date.getHours() << 11 | date.getMinutes() << 5 | Math.floor(date.getSeconds() / 2),
+      date: Math.max(0, date.getFullYear() - 1980) << 9 | date.getMonth() + 1 << 5 | date.getDate(),
+    };
+  }
+
+  function makeZip() {
+    const entries = [];
+    let size = 0;
+    const names = new Set();
+    return {
+      get size() {
+        return size;
+      },
+      get count() {
+        return entries.length;
+      },
+      /* Adds a file; a name already used gets " (2)", " (3)" … before its extension. */
+      async add(name, blob, when = new Date()) {
+        let unique = name;
+        for (let n = 2; names.has(unique); n++) unique = name.replace(/(\.[^.]*)?$/, " (" + n + ")$1");
+        names.add(unique);
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        entries.push({ name: new TextEncoder().encode(unique), blob, crc: crc32(bytes), length: bytes.length, ...dosTime(when) });
+        size += bytes.length;
+      },
+      toBlob() {
+        const parts = [];
+        const central = [];
+        let offset = 0;
+        for (const entry of entries) {
+          const local = new DataView(new ArrayBuffer(30));
+          local.setUint32(0, 0x04034b50, true);
+          local.setUint16(4, 20, true);
+          local.setUint16(6, 0x0800, true);
+          local.setUint16(8, 0, true);
+          local.setUint16(10, entry.time, true);
+          local.setUint16(12, entry.date, true);
+          local.setUint32(14, entry.crc, true);
+          local.setUint32(18, entry.length, true);
+          local.setUint32(22, entry.length, true);
+          local.setUint16(26, entry.name.length, true);
+          local.setUint16(28, 0, true);
+          parts.push(local.buffer, entry.name, entry.blob);
+          const header = new DataView(new ArrayBuffer(46));
+          header.setUint32(0, 0x02014b50, true);
+          header.setUint16(4, 20, true);
+          header.setUint16(6, 20, true);
+          header.setUint16(8, 0x0800, true);
+          header.setUint16(10, 0, true);
+          header.setUint16(12, entry.time, true);
+          header.setUint16(14, entry.date, true);
+          header.setUint32(16, entry.crc, true);
+          header.setUint32(20, entry.length, true);
+          header.setUint32(24, entry.length, true);
+          header.setUint16(28, entry.name.length, true);
+          header.setUint32(42, offset, true);
+          central.push(header.buffer, entry.name);
+          offset += 30 + entry.name.length + entry.length;
+        }
+        const centralSize = central.reduce((total, part) => total + part.byteLength, 0);
+        const end = new DataView(new ArrayBuffer(22));
+        end.setUint32(0, 0x06054b50, true);
+        end.setUint16(8, entries.length, true);
+        end.setUint16(10, entries.length, true);
+        end.setUint32(12, centralSize, true);
+        end.setUint32(16, offset, true);
+        return new Blob([...parts, ...central, end.buffer], { type: "application/zip" });
+      },
     };
   }
 
@@ -504,7 +683,7 @@
     button.repaint = () => {
       button.painted = true;
       if (button.classList.contains("busy") || button.querySelector(".percent")) return;
-      const done = isDownloaded(key);
+      const done = postDone(id);
       setIcon("download");
       button.classList.toggle("downloaded", done);
       button.title = done ? "Downloaded · click to download every photo and video again" : "Download every photo and video";
@@ -583,6 +762,424 @@
     return reply?.closest('[role="group"]') || null;
   }
 
+  /* ---------- Every photo or video of a profile ---------- */
+
+  /* Which half of a profile's media tab is showing: "photo" (?filter=photo) or "video", and
+     whose profile it is. */
+  const mediaTabKind = () => new URLSearchParams(location.search).get("filter") === "photo" ? "photo" : "video";
+  const mediaTabUser = () => location.pathname.match(/^\/(\w{1,15})\/media\/?$/)?.[1] || null;
+
+  /* Where the next page of a timeline starts. */
+  function bottomCursor(value, depth = 0) {
+    if (!value || typeof value !== "object" || depth > 40) return null;
+    if (value.cursorType === "Bottom" && typeof value.value === "string") return value.value;
+    for (const key in value) {
+      const found = bottomCursor(value[key], depth + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  /* Waits, a second at a time, so a stopped run doesn't keep waiting. */
+  async function waitUnlessStopped(ms, run) {
+    for (const end = Date.now() + ms; Date.now() < end && !run.stopped;) await wait(Math.min(1000, end - Date.now()));
+  }
+
+  /* One page of a profile's photos or videos, asked for as X's own page asks for it (the same
+     address and headers, with the next cursor). When X says to slow down (429), waits until it
+     allows more. */
+  async function timelinePage(run, cursor, update) {
+    const template = shared.timelines[run.kind === "photo" ? "UserPhotoTimeline" : "UserVideoTimeline"] || shared.timelines.UserMedia;
+    if (!template) throw new Error("Couldn't find X's list of posts. Reload the page and try again.");
+    const url = new URL(template.url);
+    const variables = JSON.parse(url.searchParams.get("variables") || "{}");
+    const userId = shared.userIds.get(run.user.toLowerCase());
+    if (userId) variables.userId = userId;
+    if (!variables.userId) throw new Error("Couldn't find this account. Reload the page and try again.");
+    if (cursor) variables.cursor = cursor;
+    else delete variables.cursor;
+    url.searchParams.set("variables", JSON.stringify(variables));
+    /* A transaction id is made for each request: an old one is left out rather than sent again. */
+    const headers = {};
+    for (const [name, value] of Object.entries(template.headers)) if (!/^x-client-transaction-id$/i.test(name)) headers[name] = value;
+    for (let attempt = 0; ; attempt++) {
+      const response = await shared.nativeFetch(url.href, { headers, credentials: "include" });
+      if (response.status === 429 && attempt < 6 && !run.stopped) {
+        const reset = Number(response.headers.get("x-rate-limit-reset")) * 1000;
+        const delay = reset > Date.now() ? Math.min(reset - Date.now() + 2000, 16 * 60 * 1000) : 60 * 1000;
+        run.note = "X asks to slow down: carrying on in " + Math.ceil(delay / 60000) + " min.";
+        update();
+        await waitUnlessStopped(delay, run);
+        run.note = "";
+        update();
+        continue;
+      }
+      if (!response.ok) throw new Error("X answered " + response.status + " when asked for the posts.");
+      return response.json();
+    }
+  }
+
+  /* A ZIP part is saved once its files reach this size, so a run never holds more than about
+     this much in memory, and a stopped or failed run keeps what was saved before. */
+  const PART_SIZE = 500 * 1024 * 1024;
+
+  /* The run in progress: { user, kind, folder, saved, skipped, failed, part, partSize, stopped,
+     done, note }. One at a time. */
+  let bulk = null;
+
+  /* The folder runs save into is chosen once (the chooser opens in Downloads) and remembered,
+     as a handle kept in x.com's IndexedDB: Tampermonkey's storage can't hold one. */
+  const FOLDER_DB = "xDownloader";
+  async function folderStore(mode, action) {
+    const open = indexedDB.open(FOLDER_DB, 1);
+    open.onupgradeneeded = () => open.result.createObjectStore("handles");
+    const db = await new Promise((resolve, reject) => {
+      open.onsuccess = () => resolve(open.result);
+      open.onerror = () => reject(open.error);
+    });
+    try {
+      const request = action(db.transaction("handles", mode).objectStore("handles"));
+      return await new Promise((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+    } finally {
+      db.close();
+    }
+  }
+  const savedFolder = () => folderStore("readonly", store => store.get("folder")).catch(() => null);
+  const saveFolder = handle => folderStore("readwrite", store => store.put(handle, "folder")).catch(error =>
+    console.warn(LOG, "couldn't remember the folder", error));
+  const forgetFolder = () => folderStore("readwrite", store => store.delete("folder")).catch(() => {});
+
+  /* Where a run saves, when the browser can write to a folder (Chrome, Edge): in the folder
+     chosen once (Downloads, say), a folder named after the account, "NASA". The browser asks
+     again for leave to write there when it has forgotten it (it can be told to allow it on every
+     visit). Returns null when the browser can't write to a folder, or the chooser couldn't
+     open: then the run makes ZIP files. Throws an AbortError when the user says no. */
+  async function chooseFolder(user, kind) {
+    if (typeof page.showDirectoryPicker !== "function") return null;
+    const noun = kind === "photo" ? "photo" : "video";
+    let parent = await savedFolder();
+    if (parent) {
+      try {
+        let state = await parent.queryPermission({ mode: "readwrite" });
+        if (state !== "granted") state = await parent.requestPermission({ mode: "readwrite" });
+        if (state !== "granted") parent = null;
+      } catch (error) {
+        console.warn(LOG, "couldn't use the remembered folder", error);
+        parent = null;
+      }
+    }
+    if (parent) {
+      if (!confirm("Download every " + noun + " of @" + user + " into " + parent.name + "/" + user + "?\n\n" +
+        "Posts you already downloaded are skipped. (Another folder: \"Change download folder\" in Tampermonkey's menu.)")) {
+        throw new DOMException("Cancelled", "AbortError");
+      }
+    } else {
+      try {
+        parent = await page.showDirectoryPicker({ id: "x-downloader", mode: "readwrite", startIn: "downloads" });
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+        console.warn(LOG, "couldn't open the folder chooser, making ZIP files instead", error);
+        return null;
+      }
+      await saveFolder(parent);
+    }
+    try {
+      const folder = await parent.getDirectoryHandle(user, { create: true });
+      folder.parentName = parent.name;
+      return folder;
+    } catch (error) {
+      /* The remembered folder was moved or deleted: it is chosen again next time. */
+      await forgetFolder();
+      throw new Error("Couldn't write to the folder " + parent.name + " (" + error.message + "). Choose it again on the next try.");
+    }
+  }
+
+  /* Writes a file into a folder, replacing one of the same name (the same photo or video, from
+     an earlier run whose download was forgotten). */
+  async function writeFile(folder, name, blob) {
+    const handle = await folder.getFileHandle(name, { create: true });
+    const writable = await handle.createWritable();
+    try {
+      await writable.write(blob);
+      await writable.close();
+    } catch (error) {
+      await writable.abort?.().catch(() => {});
+      throw error;
+    }
+  }
+
+  /* Saves the photos (kind "photo") or the videos and GIFs ("video") of every post in a
+     profile's media tab, newest first, page by page: into `folder` when there is one, each
+     file as it comes, otherwise in ZIP files of about PART_SIZE each ("NASA - photos -
+     2026-11-23 - 1.zip"). A post whose photos or videos were already downloaded (or the whole
+     post, with its button) is skipped; a post counts as downloaded once its files are in the
+     folder, or once the ZIP part that holds them has been saved. */
+  async function downloadAll(user, kind, update, folder = null) {
+    const run = bulk = { user, kind, folder: folder ? folder.parentName + "/" + folder.name : "", saved: 0, skipped: 0, failed: 0, part: 1, partSize: 0,
+      stopped: false, done: false, note: "" };
+    update(run);
+    const key = (kind === "photo" ? "p:" : "v:");
+    const day = new Date().toISOString().slice(0, 10);
+    const seen = new Set();
+    let zip = makeZip();
+    let pending = [];
+    const flush = () => {
+      if (!zip.count) return;
+      saveBlob(zip.toBlob(), user + " - " + kind + "s - " + day + " - " + run.part + ".zip");
+      for (const { id, details } of pending) markDownloaded(key + id, details);
+      run.saved += pending.length;
+      pending = [];
+      zip = makeZip();
+      run.part++;
+      run.partSize = 0;
+      update(run);
+    };
+    let cursor = null;
+    let empty = 0;
+    try {
+      while (!run.stopped) {
+        const found = [];
+        const json = await timelinePage(run, cursor, update);
+        collectPosts(json, 0, found);
+        const fresh = found.filter(post => !seen.has(post.id));
+        for (const post of fresh) seen.add(post.id);
+        for (const post of fresh) {
+          if (run.stopped) break;
+          const media = post.media.filter(item => kind === "photo" ? item.kind === "photo" : item.kind !== "photo");
+          if (!media.length) continue;
+          if (isDownloaded("t:" + post.id) || isDownloaded(key + post.id)) {
+            run.skipped++;
+            update(run);
+            continue;
+          }
+          try {
+            const files = await fetchFiles(post, media);
+            if (folder) {
+              for (const file of files) await writeFile(folder, file.name, file.blob);
+              markDownloaded(key + post.id, describePost(post, media));
+              run.saved++;
+            } else {
+              const when = post.posted ? new Date(post.posted) : new Date();
+              for (const file of files) await zip.add(file.name, file.blob, when);
+              pending.push({ id: post.id, details: describePost(post, media) });
+            }
+          } catch (error) {
+            run.failed++;
+            console.warn(LOG, "couldn't download post " + post.id, error);
+          }
+          run.partSize = zip.size;
+          update(run);
+          if (zip.size >= PART_SIZE) flush();
+        }
+        /* The end: no next page, or pages with nothing new. */
+        const next = bottomCursor(json);
+        empty = fresh.length ? 0 : empty + 1;
+        if (!next || next === cursor || empty >= 2) break;
+        cursor = next;
+      }
+    } finally {
+      /* Whatever was collected is saved, also when stopped or after an error. */
+      flush();
+      run.done = true;
+      bulk = null;
+      update(run);
+    }
+    return run;
+  }
+
+  /* Shows the state of the run in the media tab's menu and in the progress box. */
+  function updateBulk(run = bulk) {
+    for (const element of document.querySelectorAll("[data-x-downloader-item]")) element.render?.();
+    if (run) showProgress(run);
+  }
+
+  /* Starts downloading every photo or video of an account, or stops it when it is running.
+     `before` (when given) runs once the start is confirmed: the menu uses it to show that half
+     of the tab first. */
+  async function toggleBulk(user, kind, before = null) {
+    const noun = kind === "photo" ? "photo" : "video";
+    if (bulk) {
+      if (bulk.user === user && bulk.kind === kind) {
+        bulk.stopped = true;
+        updateBulk();
+      } else {
+        alert("Already downloading every " + (bulk.kind === "photo" ? "photo" : "video") + " of @" + bulk.user + ". Stop that first.");
+      }
+      before?.(false);
+      return;
+    }
+    /* Choosing the folder (or saying yes to the remembered one) is the go-ahead; without one
+       (another browser), a question about ZIP files is. The folder comes first: the browser
+       opens its chooser, or asks for leave to write, only right after the click. */
+    let folder = null;
+    try {
+      folder = await chooseFolder(user, kind);
+    } catch (error) {
+      if (error?.name !== "AbortError") alert(error?.message || "Couldn't use that folder.");
+      before?.(false);
+      return;
+    }
+    if (!folder && !confirm("Download every " + noun + " of @" + user + "?\n\nThey are saved in ZIP files of about " +
+      Math.round(PART_SIZE / 1024 / 1024) + " MB each. Posts you already downloaded are skipped.")) {
+      before?.(false);
+      return;
+    }
+    let run = null;
+    try {
+      await before?.(true);
+      run = await downloadAll(user, kind, current => updateBulk(current || bulk), folder);
+    } catch (error) {
+      console.error(LOG, error);
+      alert(error?.message || "Download failed.");
+    } finally {
+      updateBulk(run);
+    }
+  }
+
+  /* ---------- The progress box ---------- */
+
+  const PROGRESS_CSS = [
+    ":host{all:initial;position:fixed;right:20px;bottom:84px;z-index:2147483646;",
+    "font:14px/1.35 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;color:#fff}",
+    ".box{display:flex;align-items:center;gap:14px;min-width:260px;max-width:360px;padding:12px 12px 12px 16px;border-radius:16px;",
+    "background:rgba(22,24,28,.92);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);",
+    "box-shadow:0 8px 28px rgba(0,0,0,.35),inset 0 0 0 1px rgba(255,255,255,.1)}",
+    ".icon{flex:none;width:22px;height:22px;color:" + DONE_COLOUR + "}",
+    ".icon svg{width:100%;height:100%;fill:currentColor}",
+    ".running .icon{animation:pulse 1.2s ease-in-out infinite}",
+    "@keyframes pulse{50%{opacity:.3}}",
+    ".main{flex:1;min-width:0}",
+    ".title{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}",
+    ".line{color:#a3aab2;font-size:13px}",
+    ".note{color:#ffd400;font-size:13px}",
+    "button{all:unset;box-sizing:border-box;flex:none;cursor:pointer;border-radius:999px;font-weight:700;font-size:14px}",
+    "button:focus-visible{outline:2px solid " + DONE_COLOUR + ";outline-offset:2px}",
+    ".stop{padding:7px 14px;background:#fff;color:#0f1419}",
+    ".stop:hover{background:#e7e9ea}",
+    ".close{width:30px;height:30px;display:grid;place-items:center;color:#a3aab2;font-size:18px}",
+    ".close:hover{background:rgba(255,255,255,.1);color:#fff}",
+  ].join("");
+
+  const megabytes = bytes => (bytes / 1024 / 1024).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0) + " MB";
+
+  /* A box in the corner while a run goes on (it stays when leaving the profile), with a Stop
+     button; once the run ends it says what was saved, and goes away after a while. */
+  function showProgress(run) {
+    let host = document.querySelector(HOST_TAG + "[data-progress]");
+    if (!host) {
+      host = document.createElement(HOST_TAG);
+      host.dataset.progress = "";
+      const root = host.attachShadow({ mode: "open" });
+      const style = document.createElement("style");
+      style.textContent = PROGRESS_CSS;
+      root.append(style, document.createElement("div"));
+      isolateEvents(host);
+      document.documentElement.append(host);
+    }
+    clearTimeout(host.hideTimer);
+    const box = host.shadowRoot.lastElementChild;
+    box.className = "box" + (run.done ? "" : " running");
+    const noun = run.kind === "photo" ? "photos" : "videos";
+    const element = (tag, className, text) => {
+      const node = document.createElement(tag);
+      node.className = className;
+      if (text) node.textContent = text;
+      return node;
+    };
+    const iconBox = element("div", "icon");
+    iconBox.append(icon("download"));
+    const main = element("div", "main");
+    main.append(element("div", "title", run.done
+      ? (run.stopped ? "Stopped" : "Done") + ": " + noun + " of @" + run.user
+      : (run.stopped ? "Stopping…" : "Downloading all " + noun + " of @" + run.user)));
+    const counts = [run.saved + " posts saved"];
+    if (run.skipped) counts.push(run.skipped + " already downloaded");
+    if (run.failed) counts.push(run.failed + " failed");
+    main.append(element("div", "line", counts.join(" · ")));
+    if (run.folder) main.append(element("div", "line", "Into " + run.folder));
+    else if (!run.done) main.append(element("div", "line", "ZIP part " + run.part + ": " + megabytes(run.partSize)));
+    if (run.note) main.append(element("div", "note", run.note));
+    const button = run.done ? element("button", "close", "×") : element("button", "stop", "Stop");
+    button.type = "button";
+    button.title = run.done ? "Close" : "Stop (what was collected is saved)";
+    button.setAttribute("aria-label", button.title);
+    button.addEventListener("click", () => {
+      if (run.done) host.remove();
+      else {
+        run.stopped = true;
+        showProgress(run);
+        updateBulk();
+      }
+    });
+    if (run.stopped && !run.done) button.disabled = true;
+    box.replaceChildren(iconBox, main, button);
+    if (run.done) host.hideTimer = setTimeout(() => host.remove(), 15000);
+  }
+
+  /* The media tab's menu (Videos, Photos) gets two more items: download every video, download
+     every photo. They are copies of X's own items, so they look the same; X doesn't handle
+     them (its handlers aren't copied). Choosing the half the tab isn't showing switches the tab
+     to it first, which also has X ask for that list once (its request is the one repeated). */
+  function addMenuItems() {
+    const user = mediaTabUser();
+    const tab = user && document.querySelector('[role="tablist"] a[role="tab"][aria-expanded="true"]');
+    if (!tab || !/\/media\/?(\?|$)/i.test(tab.getAttribute("href") || "")) return;
+    const menu = document.querySelector('[role="menu"]');
+    const own = menu && [...menu.querySelectorAll('[role="menuitem"]')].filter(item => !item.hasAttribute("data-x-downloader-item"));
+    if (!own || own.length !== 2) return;
+    const added = [...menu.querySelectorAll("[data-x-downloader-item]")];
+    if (added.length) {
+      /* X redraws its menu (as a run starts) and can move its own items after ours. */
+      if (own[own.length - 1].nextElementSibling !== added[0]) own[own.length - 1].after(...added);
+      return;
+    }
+    const current = mediaTabKind();
+    /* X marks the half showing with a check mark: that item is this kind, the other one the other. */
+    const shown = own.find(item => item.querySelector("svg")) || own[current === "photo" ? 1 : 0];
+    const other = own.find(item => item !== shown);
+    const checkSvg = shown.querySelector("svg");
+    const textColour = getComputedStyle(shown.querySelector("[dir]") || shown).color;
+    const line = document.createElement("div");
+    line.setAttribute("data-x-downloader-item", "");
+    line.style.cssText = "height:1px;margin:4px 0;background:" + textColour + ";opacity:.15";
+    const items = ["video", "photo"].map(kind => {
+      const item = own[own.length - 1].cloneNode(true);
+      item.setAttribute("data-x-downloader-item", "");
+      item.removeAttribute("aria-checked");
+      const label = item.querySelector("span") || item;
+      const side = item.querySelector("svg")?.parentElement || item.lastElementChild;
+      side?.replaceChildren();
+      const mark = icon("download");
+      if (checkSvg) mark.setAttribute("class", checkSvg.getAttribute("class") || "");
+      mark.style.cssText = "fill:currentColor;color:" + textColour;
+      side?.append(mark);
+      item.render = () => {
+        const run = bulk && bulk.user === user && bulk.kind === kind ? bulk : null;
+        label.textContent = run ? (run.stopped ? "Stopping…" : "Stop downloading " + kind + "s")
+          : "Download all " + kind + "s";
+        mark.style.color = run ? DONE_COLOUR : textColour;
+      };
+      item.render();
+      item.addEventListener("click", event => {
+        event.stopPropagation();
+        event.preventDefault();
+        toggleBulk(user, kind, async go => {
+          /* X's own item closes the menu: the other half's also shows it, when a run starts there. */
+          (go && kind !== current ? other : shown).click();
+          if (!go || kind === current) return;
+          const name = kind === "photo" ? "UserPhotoTimeline" : "UserVideoTimeline";
+          const since = Date.now();
+          for (let waited = 0; waited < 10000 && !(shared.timelines[name]?.at >= since); waited += 200) await wait(200);
+        });
+      });
+      return item;
+    });
+    own[own.length - 1].after(line, ...items);
+  }
+
   function startButtons() {
     const hosts = new Set();
     const scan = () => {
@@ -599,6 +1196,7 @@
         bar.append(host);
         hosts.add(host);
       }
+      addMenuItems();
     };
     let queued = false;
     const queue = () => {
@@ -621,13 +1219,13 @@
     };
   }
 
-  function toast(message) {
+  function toast(message, duration = 2500) {
     const note = document.createElement("div");
     note.textContent = message;
     note.style.cssText = "position:fixed;left:50%;bottom:32px;transform:translateX(-50%);z-index:2147483647;padding:10px 16px;" +
       "border-radius:999px;background:rgba(22,22,22,.85);color:#fff;font:14px -apple-system,sans-serif;pointer-events:none";
     document.documentElement.append(note);
-    setTimeout(() => note.remove(), 2500);
+    setTimeout(() => note.remove(), duration);
   }
 
   /* ---------- The list of downloads ---------- */
@@ -691,20 +1289,28 @@
 
   const PAGE_SIZE = 150;
 
-  /* Every remembered download, newest first, as the panel shows it. */
+  /* Every remembered download, newest first, as the panel shows it: one line per post, whether
+     it was saved whole, or its photos and its videos each with "download all". */
   function downloadLines() {
-    return [...downloaded].map(key => {
-      const info = store.get("i:" + key) || {};
+    const groups = new Map();
+    for (const key of downloaded) {
       const id = key.split(":")[1];
+      const group = groups.get(id) || [];
+      group.push({ key, info: store.get("i:" + key) || {} });
+      groups.set(id, group);
+    }
+    return [...groups].map(([id, group]) => {
+      group.sort((a, b) => (b.info.at || 0) - (a.info.at || 0));
+      const info = group[0].info;
       return {
-        key,
+        keys: group.map(record => record.key),
         id,
         at: info.at || 0,
         owner: info.owner ? ownerName(info.owner, info.name) : "",
         text: info.text || "",
-        kind: info.kind || "Post",
+        kind: [...new Set(group.map(record => record.info.kind || "Post"))].join(", "),
         link: info.link || "https://x.com/i/status/" + id,
-        thumb: info.thumb || "",
+        thumb: group.map(record => record.info.thumb).find(Boolean) || "",
       };
     }).sort((a, b) => b.at - a.at);
   }
@@ -828,7 +1434,7 @@
       remove.setAttribute("aria-label", remove.title);
       remove.append(panelIcon("remove"));
       remove.addEventListener("click", () => {
-        forgetDownload(line.key);
+        for (const key of line.keys) forgetDownload(key);
         lines.splice(lines.indexOf(line), 1);
         row.remove();
         showCount(matching().length);
@@ -881,7 +1487,13 @@
       toast("X Downloader is off.");
       return;
     }
-    if (typeof GM_registerMenuCommand === "function") GM_registerMenuCommand("Downloads", openDownloads);
+    if (typeof GM_registerMenuCommand === "function") {
+      GM_registerMenuCommand("Downloads", openDownloads);
+      if (typeof page.showDirectoryPicker === "function") {
+        GM_registerMenuCommand("Change download folder", () => forgetFolder().then(() =>
+          toast("The next \"Download all\" asks where to save.", 4000)));
+      }
+    }
     const begin = () => {
       page.__xDownloader = startButtons();
       if (!AUTO_START) toast("X Downloader is on. Click the bookmarklet again to turn it off.");
@@ -891,7 +1503,8 @@
   }
 
   /* Exposed for smoke-test.js only. */
-  if (page.__xDownloaderTest) page.__xDownloaderTest({ fromApi, fromEmbed, collectText, posts, mediaOf, fileBase, embedToken, idOfArticle });
+  if (page.__xDownloaderTest) page.__xDownloaderTest({ fromApi, fromEmbed, collectText, posts, mediaOf, fileBase, embedToken, idOfArticle,
+    shared, downloadAll, postDone, bottomCursor, isDownloaded, markDownloaded, downloadLines, makeZip });
 
   try {
     start();
