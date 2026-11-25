@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         X Downloader
-// @version      0.1.1
+// @version      0.1.2
 // @description  Adds a download button to posts on X that saves every photo (original size) and video (highest quality), and remembers what was downloaded.
 // @match        https://x.com/*
 // @match        https://twitter.com/*
@@ -46,7 +46,7 @@
 
   const AUTO_START = true;
   /* Set by build.js to the userscript's version. */
-  const VERSION = "0.1.1";
+  const VERSION = "0.1.2";
   const HOST_TAG = "x-downloader";
   const LOG = "[X Downloader]";
   /* X's blue, for buttons whose post has been downloaded. */
@@ -764,9 +764,12 @@
 
   /* ---------- Every photo or video of a profile ---------- */
 
-  /* Which half of a profile's media tab is showing: "photo" (?filter=photo) or "video", and
-     whose profile it is. */
-  const mediaTabKind = () => new URLSearchParams(location.search).get("filter") === "photo" ? "photo" : "video";
+  /* Which choice of a profile's media tab is showing: "photo" (?filter=photo), "video" (no
+     filter), or null for another one (live broadcasts); and whose profile it is. */
+  const mediaTabKind = () => {
+    const filter = new URLSearchParams(location.search).get("filter");
+    return filter === "photo" ? "photo" : !filter || filter === "video" ? "video" : null;
+  };
   const mediaTabUser = () => location.pathname.match(/^\/(\w{1,15})\/media\/?$/)?.[1] || null;
 
   /* Where the next page of a timeline starts. */
@@ -1119,17 +1122,19 @@
     if (run.done) host.hideTimer = setTimeout(() => host.remove(), 15000);
   }
 
-  /* The media tab's menu (Videos, Photos) gets two more items: download every video, download
-     every photo. They are copies of X's own items, so they look the same; X doesn't handle
-     them (its handlers aren't copied). Choosing the half the tab isn't showing switches the tab
-     to it first, which also has X ask for that list once (its request is the one repeated). */
+  /* The media tab's menu (Videos, Photos, Live broadcasts …) gets two more items: download
+     every video, download every photo. They are copies of X's own items, so they look the same;
+     X doesn't handle them (its handlers aren't copied). X's items are told apart by nothing but
+     their (translated) text, so they are never relied on: choosing a kind the tab isn't showing
+     changes the address to it (as X's own item does), which also has X ask for that list once
+     (its request is the one repeated). */
   function addMenuItems() {
     const user = mediaTabUser();
     const tab = user && document.querySelector('[role="tablist"] a[role="tab"][aria-expanded="true"]');
     if (!tab || !/\/media\/?(\?|$)/i.test(tab.getAttribute("href") || "")) return;
     const menu = document.querySelector('[role="menu"]');
     const own = menu && [...menu.querySelectorAll('[role="menuitem"]')].filter(item => !item.hasAttribute("data-x-downloader-item"));
-    if (!own || own.length !== 2) return;
+    if (!own || own.length < 2) return;
     const added = [...menu.querySelectorAll("[data-x-downloader-item]")];
     if (added.length) {
       /* X redraws its menu (as a run starts) and can move its own items after ours. */
@@ -1137,11 +1142,14 @@
       return;
     }
     const current = mediaTabKind();
-    /* X marks the half showing with a check mark: that item is this kind, the other one the other. */
-    const shown = own.find(item => item.querySelector("svg")) || own[current === "photo" ? 1 : 0];
-    const other = own.find(item => item !== shown);
-    const checkSvg = shown.querySelector("svg");
-    const textColour = getComputedStyle(shown.querySelector("[dir]") || shown).color;
+    /* X marks the choice showing with a check mark; choosing it again only closes the menu. */
+    const shown = own.find(item => item.querySelector("svg"));
+    const checkSvg = shown?.querySelector("svg");
+    const textColour = getComputedStyle(own[0].querySelector("[dir]") || own[0]).color;
+    const closeMenu = () => {
+      if (shown?.isConnected) shown.click();
+      else menu.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, bubbles: true }));
+    };
     const line = document.createElement("div");
     line.setAttribute("data-x-downloader-item", "");
     line.style.cssText = "height:1px;margin:4px 0;background:" + textColour + ";opacity:.15";
@@ -1167,11 +1175,13 @@
         event.stopPropagation();
         event.preventDefault();
         toggleBulk(user, kind, async go => {
-          /* X's own item closes the menu: the other half's also shows it, when a run starts there. */
-          (go && kind !== current ? other : shown).click();
+          closeMenu();
           if (!go || kind === current) return;
-          const name = kind === "photo" ? "UserPhotoTimeline" : "UserVideoTimeline";
+          /* The tab shows that kind, as X's own item would do: X's router follows the address. */
           const since = Date.now();
+          page.history.pushState(page.history.state, "", "/" + user + "/media" + (kind === "photo" ? "?filter=photo" : ""));
+          page.dispatchEvent(new PopStateEvent("popstate", { state: page.history.state }));
+          const name = kind === "photo" ? "UserPhotoTimeline" : "UserVideoTimeline";
           for (let waited = 0; waited < 10000 && !(shared.timelines[name]?.at >= since); waited += 200) await wait(200);
         });
       });
